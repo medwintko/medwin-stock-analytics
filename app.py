@@ -301,7 +301,7 @@ with fundamentals_tab:
         fundamentals = cached_fundamentals(tuple([symbol for symbol in stocks if symbol in available_symbols]))
 
     # Display a message when no company fundamentals were returned.
-    if fundamentals.empty:
+    if fundamentals.empty or fundamentals.dropna(how="all").empty:
         # Explain the provider limitation without failing the entire dashboard.
         st.warning("No fundamental data was returned for the selected companies.")
     else:

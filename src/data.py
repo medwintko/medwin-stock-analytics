@@ -19,6 +19,109 @@ FUNDAMENTAL_FIELDS = {
 }
 
 
+def _statement_row(statement: pd.DataFrame, possible_names: list[str]) -> pd.Series:
+    """Return the first matching financial-statement row or an empty series."""
+    # Check the preferred row labels in order because providers sometimes rename fields.
+    for name in possible_names:
+        # Return the row as soon as an exact label is available.
+        if name in statement.index:
+            # Convert its values to numbers and replace unexpected text with missing values.
+            return pd.to_numeric(statement.loc[name], errors="coerce").dropna()
+
+    # Return a typed empty series when none of the possible labels exists.
+    return pd.Series(dtype="float64")
+
+
+def _statement_fundamentals(stock: yf.Ticker) -> dict[str, float]:
+    """Derive selected fundamentals from price and financial-statement data."""
+    # Start with missing values so any unavailable calculation remains explicit.
+    result = {display_name: np.nan for display_name in FUNDAMENTAL_FIELDS.values()}
+
+    # Retrieve the faster price summary used for market capitalization and last price.
+    try:
+        # Convert the provider's lazy mapping into a normal dictionary.
+        fast_information = dict(stock.fast_info)
+    except Exception:
+        # Continue with an empty dictionary if the fast endpoint is unavailable.
+        fast_information = {}
+
+    # Store market capitalization when the fast endpoint supplies it.
+    result["Market Cap"] = fast_information.get("marketCap", np.nan)
+
+    # Protect the remaining fallback from missing financial-statement endpoints.
+    try:
+        # Retrieve annual income-statement data for growth and profitability measures.
+        annual_income = stock.income_stmt
+
+        # Retrieve quarterly income data for trailing twelve-month earnings per share.
+        quarterly_income = stock.quarterly_income_stmt
+
+        # Retrieve the annual balance sheet for leverage measures.
+        balance_sheet = stock.balance_sheet
+
+        # Find total revenue using the common provider row labels.
+        annual_revenue = _statement_row(annual_income, ["Total Revenue", "Operating Revenue"])
+
+        # Find net income using the common provider row labels.
+        annual_net_income = _statement_row(
+            annual_income,
+            ["Net Income", "Net Income Common Stockholders"],
+        )
+
+        # Calculate annual revenue growth when two complete fiscal years are available.
+        if len(annual_revenue) >= 2 and annual_revenue.iloc[1] != 0:
+            # Compare the most recent fiscal year with the previous fiscal year.
+            result["Revenue Growth"] = annual_revenue.iloc[0] / annual_revenue.iloc[1] - 1
+
+        # Calculate annual earnings growth when two complete fiscal years are available.
+        if len(annual_net_income) >= 2 and annual_net_income.iloc[1] != 0:
+            # Use the absolute previous value so a prior loss does not reverse the growth sign.
+            result["Earnings Growth"] = (
+                annual_net_income.iloc[0] - annual_net_income.iloc[1]
+            ) / abs(annual_net_income.iloc[1])
+
+        # Calculate the latest full-year net profit margin.
+        if len(annual_revenue) >= 1 and len(annual_net_income) >= 1 and annual_revenue.iloc[0] != 0:
+            # Divide net income by revenue for the same latest annual reporting column.
+            result["Profit Margin"] = annual_net_income.iloc[0] / annual_revenue.iloc[0]
+
+        # Retrieve diluted earnings per share for the latest reported quarters.
+        quarterly_eps = _statement_row(quarterly_income, ["Diluted EPS", "Basic EPS"])
+
+        # Read the latest market price from the fast summary.
+        latest_price = fast_information.get("lastPrice", np.nan)
+
+        # Calculate trailing P/E when four quarters and a positive EPS total are available.
+        if len(quarterly_eps) >= 4 and pd.notna(latest_price):
+            # Add the latest four reported quarters to form trailing-twelve-month EPS.
+            trailing_eps = quarterly_eps.iloc[:4].sum()
+
+            # Avoid a misleading P/E value when trailing earnings are zero or negative.
+            if trailing_eps > 0:
+                # Divide the latest price by trailing-twelve-month diluted EPS.
+                result["Trailing P/E"] = latest_price / trailing_eps
+
+        # Find the latest reported total debt.
+        total_debt = _statement_row(balance_sheet, ["Total Debt"])
+
+        # Find the latest reported shareholder equity.
+        stockholder_equity = _statement_row(
+            balance_sheet,
+            ["Stockholders Equity", "Common Stock Equity"],
+        )
+
+        # Calculate debt to equity when both balance-sheet values are available.
+        if len(total_debt) >= 1 and len(stockholder_equity) >= 1 and stockholder_equity.iloc[0] != 0:
+            # Express total debt as a multiple of shareholder equity.
+            result["Debt to Equity"] = total_debt.iloc[0] / stockholder_equity.iloc[0]
+    except Exception:
+        # Keep any values already found when one statement endpoint fails.
+        pass
+
+    # Return the complete fallback dictionary.
+    return result
+
+
 def clean_tickers(tickers: Iterable[str]) -> list[str]:
     """Return unique, uppercase ticker symbols while preserving their order."""
     # Create an empty list that will keep the cleaned ticker symbols.
@@ -109,20 +212,36 @@ def fetch_fundamentals(tickers: Iterable[str]) -> pd.DataFrame:
         # Begin the record with the ticker symbol.
         row: dict[str, object] = {"Symbol": symbol}
 
+        # Create one reusable company object for all provider requests.
+        stock = yf.Ticker(symbol)
+
         # Protect the dashboard from temporary provider failures.
         try:
             # Retrieve the latest company information dictionary.
-            company_info = yf.Ticker(symbol).info
+            company_info = stock.info
 
             # Copy each selected provider field into a readable column.
             for source_name, display_name in FUNDAMENTAL_FIELDS.items():
                 # Use get so unavailable fields become missing values.
-                row[display_name] = company_info.get(source_name, np.nan)
+                value = company_info.get(source_name, np.nan)
+
+                # Convert provider nulls into numeric missing values for consistent display.
+                row[display_name] = np.nan if value is None else value
         except Exception:
             # Fill every requested field with a numeric missing value after a failure.
             for display_name in FUNDAMENTAL_FIELDS.values():
                 # Store NaN so pandas handles the field consistently.
                 row[display_name] = np.nan
+
+        # Derive missing fields from public statements when the summary endpoint is blocked.
+        fallback_values = _statement_fundamentals(stock)
+
+        # Fill only fields that the primary company-summary request did not provide.
+        for display_name, fallback_value in fallback_values.items():
+            # Preserve a valid summary value and use the fallback only for missing data.
+            if pd.isna(row.get(display_name)) and pd.notna(fallback_value):
+                # Store the calculated or alternative provider value.
+                row[display_name] = fallback_value
 
         # Add the completed company record to the result list.
         rows.append(row)
@@ -135,8 +254,16 @@ def fetch_fundamentals(tickers: Iterable[str]) -> pd.DataFrame:
     # Convert the company records into a table indexed by stock symbol.
     fundamentals = pd.DataFrame(rows).set_index("Symbol")
 
-    # Convert Yahoo's debt-to-equity percentage-like scale into a ratio.
-    fundamentals["Debt to Equity"] = fundamentals["Debt to Equity"] / 100
+    # Convert all displayed fields to numeric values and preserve unavailable values as NaN.
+    fundamentals = fundamentals.apply(pd.to_numeric, errors="coerce")
+
+    # Identify debt-to-equity values retrieved from Yahoo's percentage-like summary scale.
+    summary_scale = fundamentals["Debt to Equity"].abs() > 10
+
+    # Convert only those percentage-like summary values into ordinary ratios.
+    fundamentals.loc[summary_scale, "Debt to Equity"] = (
+        fundamentals.loc[summary_scale, "Debt to Equity"] / 100
+    )
 
     # Return the numeric table so the display layer can choose its own formatting.
     return fundamentals
@@ -203,4 +330,3 @@ def fetch_earnings_dates(ticker: str, limit: int = 8) -> pd.DatetimeIndex:
 
     # Return the clean dates in a pandas date index.
     return pd.DatetimeIndex(dates)
-
